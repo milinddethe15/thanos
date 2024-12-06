@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
@@ -40,6 +41,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
+	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -1436,4 +1438,68 @@ func TestStoreGatewayLazyExpandedPostingsPromQLSmithFuzz(t *testing.T) {
 	if failures > 0 {
 		require.Failf(t, "finished store gateway lazy expanded posting fuzzing tests", "%d test cases failed", failures)
 	}
+}
+
+func TestStoreGatewayHedgedRequests(t *testing.T) {
+	t.Parallel()
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Logf("Received request: %s", r.URL.Path)
+		time.Sleep(10 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	defer mockServer.Close()
+	e, err := e2e.NewDockerEnvironment("hedged-requests")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	const bucket = "test-bucket"
+	invalidURL := mockServer.URL
+
+	m := e2edb.NewMinio(e, "thanos-minio", bucket, e2edb.WithMinioTLS())
+	testutil.Ok(t, e2e.StartAndWaitReady(m))
+
+	s1 := e2ethanos.NewStoreGW(
+		e,
+		"1",
+		e2ethanos.BucketHedgingConfig{
+			BucketConfig: client.BucketConfig{
+				Type:   client.S3,
+				Config: e2ethanos.NewS3Config(bucket, invalidURL, m.InternalDir()),
+			},
+			HedgingConfig: exthttp.HedgingConfig{
+				Enabled:  true,
+				UpTo:     3,
+				Quantile: 0.9,
+			},
+		},
+		"",
+		"",
+		nil,
+	)
+
+	testutil.Ok(t, e2e.StartAndWaitReady(s1))
+
+	// Create a querier to query the store gateway
+	q := e2ethanos.NewQuerierBuilder(e, "1", s1.InternalEndpoint("grpc")).Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+	// Wait for the store gateway to sync metrics
+	testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(0), "thanos_blocks_meta_synced"))
+	testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(0), "thanos_bucket_store_blocks_loaded"))
+
+	// ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// t.Cleanup(cancel)
+	// Generate a simple PromQL query
+	// query := "http_requests_total{job=\"test\"}"
+
+	// // Send query to the querier
+	// _, warnings, err := promclient.QueryGRPC(ctx, q.Endpoint("http"), query)
+	// testutil.Ok(t, err)
+	// testutil.Assert(t, len(warnings) == 0, "Expected no warnings but got %v", warnings)
+
+	// // Validate hedged requests were made
+	// // Check metrics for hedged requests (assume metric name is `thanos_hedged_requests_total`)
+	// testutil.Ok(t, s1.WaitSumMetrics(e2emon.Greater(0), "thanos_hedged_requests_total"))
 }

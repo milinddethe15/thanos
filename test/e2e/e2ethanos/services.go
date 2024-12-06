@@ -31,6 +31,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/alert"
 	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
 	"github.com/thanos-io/thanos/pkg/clientconfig"
+	texthttp "github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	"github.com/thanos-io/thanos/pkg/receive"
 )
@@ -918,7 +919,12 @@ receivers:
 	})), "http")
 }
 
-func NewStoreGW(e e2e.Environment, name string, bucketConfig client.BucketConfig, cacheConfig, indexCacheConfig string, extArgs []string, relabelConfig ...relabel.Config) *e2eobs.Observable {
+type BucketHedgingConfig struct {
+	client.BucketConfig    `yaml:",inline"`
+	texthttp.HedgingConfig `yaml:"hedging_config"`
+}
+
+func NewStoreGW(e e2e.Environment, name string, bucketConfig BucketHedgingConfig, cacheConfig, indexCacheConfig string, extArgs []string, relabelConfig ...relabel.Config) *e2eobs.Observable {
 	f := e.Runnable(fmt.Sprintf("store-gw-%v", name)).
 		WithPorts(map[string]int{"http": 8080, "grpc": 9091}).
 		Future()
