@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -17,17 +18,14 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"go.uber.org/atomic"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 
 	"github.com/thanos-io/thanos/pkg/api/status"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -36,9 +34,11 @@ import (
 	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/receive/expandedpostingscache"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
@@ -64,11 +64,10 @@ type MultiTSDB struct {
 	hashFunc              metadata.HashFunc
 	hashringConfigs       []HashringConfig
 
-	tsdbClients           []store.Client
-	tsdbClientsNeedUpdate bool
+	matcherCache storecache.MatchersCache
 
-	exemplarClients           map[string]*exemplars.TSDB
-	exemplarClientsNeedUpdate bool
+	tsdbClients     []store.Client
+	exemplarClients map[string]*exemplars.TSDB
 
 	metricNameFilterEnabled bool
 
@@ -98,6 +97,12 @@ func WithBlockExpandedPostingsCacheSize(size uint64) MultiTSDBOption {
 	}
 }
 
+func WithMatchersCache(cache storecache.MatchersCache) MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.matcherCache = cache
+	}
+}
+
 // NewMultiTSDB creates new MultiTSDB.
 // NOTE: Passed labels must be sorted lexicographically (alphabetically).
 func NewMultiTSDB(
@@ -117,19 +122,20 @@ func NewMultiTSDB(
 	}
 
 	mt := &MultiTSDB{
-		dataDir:                   dataDir,
-		logger:                    log.With(l, "component", "multi-tsdb"),
-		reg:                       reg,
-		tsdbOpts:                  tsdbOpts,
-		mtx:                       &sync.RWMutex{},
-		tenants:                   map[string]*tenant{},
-		labels:                    labels,
-		tsdbClientsNeedUpdate:     true,
-		exemplarClientsNeedUpdate: true,
-		tenantLabelName:           tenantLabelName,
-		bucket:                    bucket,
-		allowOutOfOrderUpload:     allowOutOfOrderUpload,
-		hashFunc:                  hashFunc,
+		dataDir:               dataDir,
+		logger:                log.With(l, "component", "multi-tsdb"),
+		reg:                   reg,
+		tsdbOpts:              tsdbOpts,
+		mtx:                   &sync.RWMutex{},
+		tenants:               map[string]*tenant{},
+		labels:                labels,
+		tsdbClients:           make([]store.Client, 0),
+		exemplarClients:       map[string]*exemplars.TSDB{},
+		tenantLabelName:       tenantLabelName,
+		bucket:                bucket,
+		allowOutOfOrderUpload: allowOutOfOrderUpload,
+		hashFunc:              hashFunc,
+		matcherCache:          storecache.NoopMatchersCache,
 	}
 
 	for _, option := range options {
@@ -137,6 +143,49 @@ func NewMultiTSDB(
 	}
 
 	return mt
+}
+
+// testGetTenant returns the tenant with the given tenantID for testing purposes.
+func (t *MultiTSDB) testGetTenant(tenantID string) *tenant {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return t.tenants[tenantID]
+}
+
+func (t *MultiTSDB) updateTSDBClients() {
+	t.tsdbClients = t.tsdbClients[:0]
+	for _, tenant := range t.tenants {
+		client := tenant.client()
+		if client != nil {
+			t.tsdbClients = append(t.tsdbClients, client)
+		}
+	}
+}
+
+func (t *MultiTSDB) addTenantUnlocked(tenantID string, newTenant *tenant) {
+	t.tenants[tenantID] = newTenant
+	t.updateTSDBClients()
+	if newTenant.exemplars() != nil {
+		t.exemplarClients[tenantID] = newTenant.exemplars()
+	}
+}
+
+func (t *MultiTSDB) addTenantLocked(tenantID string, newTenant *tenant) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	t.addTenantUnlocked(tenantID, newTenant)
+}
+
+func (t *MultiTSDB) removeTenantUnlocked(tenantID string) {
+	delete(t.tenants, tenantID)
+	delete(t.exemplarClients, tenantID)
+	t.updateTSDBClients()
+}
+
+func (t *MultiTSDB) removeTenantLocked(tenantID string) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	t.removeTenantUnlocked(tenantID)
 }
 
 type localClient struct {
@@ -433,9 +482,7 @@ func (t *MultiTSDB) Prune(ctx context.Context) error {
 		}
 
 		level.Info(t.logger).Log("msg", "Pruned tenant", "tenant", tenantID)
-		delete(t.tenants, tenantID)
-		t.tsdbClientsNeedUpdate = true
-		t.exemplarClientsNeedUpdate = true
+		t.removeTenantUnlocked(tenantID)
 	}
 
 	return merr.Err()
@@ -595,58 +642,17 @@ func (t *MultiTSDB) RemoveLockFilesIfAny() error {
 	return merr.Err()
 }
 
+// TSDBLocalClients should be used as read-only.
 func (t *MultiTSDB) TSDBLocalClients() []store.Client {
 	t.mtx.RLock()
-	if !t.tsdbClientsNeedUpdate {
-		t.mtx.RUnlock()
-		return t.tsdbClients
-	}
-
-	t.mtx.RUnlock()
-	t.mtx.Lock()
-	defer t.mtx.Unlock()
-	if !t.tsdbClientsNeedUpdate {
-		return t.tsdbClients
-	}
-
-	res := make([]store.Client, 0, len(t.tenants))
-	for _, tenant := range t.tenants {
-		client := tenant.client()
-		if client != nil {
-			res = append(res, client)
-		}
-	}
-
-	t.tsdbClientsNeedUpdate = false
-	t.tsdbClients = res
-
+	defer t.mtx.RUnlock()
 	return t.tsdbClients
 }
 
+// TSDBExemplars should be used as read-only.
 func (t *MultiTSDB) TSDBExemplars() map[string]*exemplars.TSDB {
 	t.mtx.RLock()
-	if !t.exemplarClientsNeedUpdate {
-		t.mtx.RUnlock()
-		return t.exemplarClients
-	}
-	t.mtx.RUnlock()
-	t.mtx.Lock()
-	defer t.mtx.Unlock()
-
-	if !t.exemplarClientsNeedUpdate {
-		return t.exemplarClients
-	}
-
-	res := make(map[string]*exemplars.TSDB, len(t.tenants))
-	for k, tenant := range t.tenants {
-		e := tenant.exemplars()
-		if e != nil {
-			res[k] = e
-		}
-	}
-
-	t.exemplarClientsNeedUpdate = false
-	t.exemplarClients = res
+	defer t.mtx.RUnlock()
 	return t.exemplarClients
 }
 
@@ -709,12 +715,13 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	if t.headExpandedPostingsCacheSize > 0 || t.blockExpandedPostingsCacheSize > 0 {
 		var expandedPostingsCacheMetrics = expandedpostingscache.NewPostingCacheMetrics(extprom.WrapRegistererWithPrefix("thanos_", reg))
 
-		expandedPostingsCache = expandedpostingscache.NewBlocksPostingsForMatchersCache(expandedPostingsCacheMetrics, t.headExpandedPostingsCacheSize, t.blockExpandedPostingsCacheSize)
+		expandedPostingsCache = expandedpostingscache.NewBlocksPostingsForMatchersCache(expandedPostingsCacheMetrics, t.headExpandedPostingsCacheSize, t.blockExpandedPostingsCacheSize, 0)
 	}
 
 	opts := *t.tsdbOpts
 	opts.BlocksToDelete = tenant.blocksToDelete
 	opts.EnableDelayedCompaction = true
+	opts.CompactionDelayMaxPercent = tsdb.DefaultCompactionDelayMaxPercent
 
 	opts.BlockChunkQuerierFunc = func(b tsdb.BlockReader, mint, maxt int64) (storage.ChunkQuerier, error) {
 		if expandedPostingsCache != nil {
@@ -734,17 +741,13 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	opts.EnableOverlappingCompaction = false
 	s, err := tsdb.Open(
 		dataDir,
-		logger,
+		logutil.GoKitLogToSlog(logger),
 		reg,
 		&opts,
 		nil,
 	)
 	if err != nil {
-		t.mtx.Lock()
-		delete(t.tenants, tenantID)
-		t.tsdbClientsNeedUpdate = true
-		t.exemplarClientsNeedUpdate = true
-		t.mtx.Unlock()
+		t.removeTenantLocked(tenantID)
 		return err
 	}
 	var ship *shipper.Shipper
@@ -762,11 +765,15 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			shipper.DefaultMetaFilename,
 		)
 	}
-	options := []store.TSDBStoreOption{}
+	var options []store.TSDBStoreOption
 	if t.metricNameFilterEnabled {
 		options = append(options, store.WithCuckooMetricNameStoreFilter())
 	}
+	if t.matcherCache != nil {
+		options = append(options, store.WithMatcherCacheInstance(t.matcherCache))
+	}
 	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset))
+	t.addTenantLocked(tenantID, tenant) // need to update the client list once store is ready & client != nil
 	level.Info(logger).Log("msg", "TSDB is now ready")
 	return nil
 }
@@ -795,9 +802,7 @@ func (t *MultiTSDB) getOrLoadTenant(tenantID string, blockingStart bool) (*tenan
 	}
 
 	tenant = newTenant()
-	t.tenants[tenantID] = tenant
-	t.tsdbClientsNeedUpdate = true
-	t.exemplarClientsNeedUpdate = true
+	t.addTenantUnlocked(tenantID, tenant)
 	t.mtx.Unlock()
 
 	logger := log.With(t.logger, "tenant", tenantID)

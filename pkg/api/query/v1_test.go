@@ -31,9 +31,9 @@ import (
 	"time"
 
 	"github.com/efficientgo/core/testutil"
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -185,12 +185,10 @@ func TestQueryEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil, false)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -638,12 +636,10 @@ func TestQueryExplainEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil, false)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -707,12 +703,10 @@ func TestQueryAnalyzeEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil, false)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -857,7 +851,7 @@ func TestMetadataEndpoints(t *testing.T) {
 		series = append(series, storage.NewListSeries(lbl, samples))
 	}
 
-	_, err := tsdb.CreateBlock(series, dir, chunkRange, log.NewNopLogger())
+	_, err := tsdb.CreateBlock(series, dir, chunkRange, promslog.NewNopLogger())
 	testutil.Ok(t, err)
 
 	opts := tsdb.DefaultOptions()
@@ -881,12 +875,10 @@ func TestMetadataEndpoints(t *testing.T) {
 
 	now := time.Now()
 	timeout := 100 * time.Second
-	ef := NewQueryEngineFactory(promql.EngineOpts{
-		Logger:     nil,
-		Reg:        nil,
+	ef := NewQueryEngineFactory(engine.Opts{EngineOpts: promql.EngineOpts{
 		MaxSamples: 10000,
 		Timeout:    timeout,
-	}, nil, false)
+	}}, nil)
 	api := &QueryAPI{
 		baseAPI: &baseAPI.BaseAPI{
 			Now: func() time.Time { return now },
@@ -2172,4 +2164,9 @@ func (s sample) FH() *histogram.FloatHistogram {
 
 func (s sample) Type() chunkenc.ValueType {
 	return chunkenc.ValFloat
+}
+
+func (s sample) Copy() chunks.Sample {
+	c := sample{t: s.t, f: s.f}
+	return c
 }

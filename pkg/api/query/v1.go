@@ -27,7 +27,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -94,61 +93,62 @@ const (
 	PromqlEngineThanos     PromqlEngineType = "thanos"
 )
 
-type ThanosEngine interface {
-	promql.QueryEngine
-	NewInstantQueryFromPlan(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, plan logicalplan.Node, ts time.Time) (promql.Query, error)
-	NewRangeQueryFromPlan(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, root logicalplan.Node, start, end time.Time, step time.Duration) (promql.Query, error)
+type Engine interface {
+	MakeInstantQuery(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, qs string, ts time.Time) (promql.Query, error)
+	MakeRangeQuery(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error)
+	MakeInstantQueryFromPlan(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, plan logicalplan.Node, ts time.Time) (promql.Query, error)
+	MakeRangeQueryFromPlan(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, root logicalplan.Node, start, end time.Time, step time.Duration) (promql.Query, error)
+}
+
+type prometheusEngineAdapter struct {
+	engine promql.QueryEngine
+}
+
+func (a *prometheusEngineAdapter) MakeInstantQuery(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
+	return a.engine.NewInstantQuery(ctx, q, opts, qs, ts)
+}
+
+func (a *prometheusEngineAdapter) MakeRangeQuery(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error) {
+	return a.engine.NewRangeQuery(ctx, q, opts, qs, start, end, step)
+}
+
+func (a *prometheusEngineAdapter) MakeInstantQueryFromPlan(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, plan logicalplan.Node, ts time.Time) (promql.Query, error) {
+	return a.engine.NewInstantQuery(ctx, q, opts, plan.String(), ts)
+}
+
+func (a *prometheusEngineAdapter) MakeRangeQueryFromPlan(ctx context.Context, q storage.Queryable, opts *engine.QueryOpts, plan logicalplan.Node, start, end time.Time, step time.Duration) (promql.Query, error) {
+	return a.engine.NewRangeQuery(ctx, q, opts, plan.String(), start, end, step)
 }
 
 type QueryEngineFactory struct {
-	engineOpts            promql.EngineOpts
-	remoteEngineEndpoints promqlapi.RemoteEndpoints
-
-	createPrometheusEngine sync.Once
-	prometheusEngine       promql.QueryEngine
-
-	createThanosEngine sync.Once
-	thanosEngine       ThanosEngine
-	enableXFunctions   bool
+	prometheus Engine
+	thanos     Engine
 }
 
-func (f *QueryEngineFactory) GetPrometheusEngine() promql.QueryEngine {
-	f.createPrometheusEngine.Do(func() {
-		if f.prometheusEngine != nil {
-			return
-		}
-		f.prometheusEngine = promql.NewEngine(f.engineOpts)
-	})
-
-	return f.prometheusEngine
+func (f *QueryEngineFactory) GetPrometheusEngine() Engine {
+	return f.prometheus
 }
 
-func (f *QueryEngineFactory) GetThanosEngine() ThanosEngine {
-	f.createThanosEngine.Do(func() {
-		opts := engine.Opts{
-			EngineOpts:       f.engineOpts,
-			Engine:           f.GetPrometheusEngine(),
-			EnableAnalysis:   true,
-			EnableXFunctions: f.enableXFunctions,
-		}
-		if f.thanosEngine != nil {
-			return
-		}
-		if f.remoteEngineEndpoints == nil {
-			f.thanosEngine = engine.New(opts)
-		} else {
-			f.thanosEngine = engine.NewDistributedEngine(opts, f.remoteEngineEndpoints)
-		}
-	})
-
-	return f.thanosEngine
+func (f *QueryEngineFactory) GetThanosEngine() Engine {
+	return f.thanos
 }
 
-func NewQueryEngineFactory(engineOpts promql.EngineOpts, remoteEngineEndpoints promqlapi.RemoteEndpoints, enableExtendedFunctions bool) *QueryEngineFactory {
+func NewQueryEngineFactory(
+	engineOpts engine.Opts,
+	remoteEngineEndpoints promqlapi.RemoteEndpoints,
+) *QueryEngineFactory {
+	promEngine := promql.NewEngine(engineOpts.EngineOpts)
+	// set engine here to avoid duplicate registration of metrics
+	engineOpts.Engine = promEngine
+	var thanosEngine Engine
+	if remoteEngineEndpoints == nil {
+		thanosEngine = engine.New(engineOpts)
+	} else {
+		thanosEngine = engine.NewDistributedEngine(engineOpts, remoteEngineEndpoints)
+	}
 	return &QueryEngineFactory{
-		engineOpts:            engineOpts,
-		remoteEngineEndpoints: remoteEngineEndpoints,
-		enableXFunctions:      enableExtendedFunctions,
+		prometheus: &prometheusEngineAdapter{promEngine},
+		thanos:     thanosEngine,
 	}
 }
 
@@ -339,8 +339,8 @@ func (qapi *QueryAPI) parseEnableDedupParam(r *http.Request) (enableDeduplicatio
 	return enableDeduplication, nil
 }
 
-func (qapi *QueryAPI) parseEngineParam(r *http.Request) (queryEngine promql.QueryEngine, e PromqlEngineType, _ *api.ApiError) {
-	var engine promql.QueryEngine
+func (qapi *QueryAPI) parseEngineParam(r *http.Request) (queryEngine Engine, e PromqlEngineType, _ *api.ApiError) {
+	var engine Engine
 
 	param := PromqlEngineType(r.FormValue("engine"))
 	if param == "" {
@@ -500,7 +500,7 @@ func processAnalysis(a *engine.AnalyzeOutputNode) queryTelemetry {
 }
 
 func (qapi *QueryAPI) queryExplain(r *http.Request) (interface{}, []error, *api.ApiError, func()) {
-	engine, engineParam, apiErr := qapi.parseEngineParam(r)
+	eng, engineParam, apiErr := qapi.parseEngineParam(r)
 	if apiErr != nil {
 		return nil, nil, apiErr, func() {}
 	}
@@ -574,7 +574,7 @@ func (qapi *QueryAPI) queryExplain(r *http.Request) (interface{}, []error, *api.
 	ctx = context.WithValue(ctx, tenancy.TenantKey, tenant)
 
 	var seriesStats []storepb.SeriesStatsCounter
-	qry, err := engine.NewInstantQuery(
+	qry, err := eng.MakeInstantQuery(
 		ctx,
 		qapi.queryableCreate(
 			enableDedup,
@@ -586,7 +586,10 @@ func (qapi *QueryAPI) queryExplain(r *http.Request) (interface{}, []error, *api.
 			shardInfo,
 			query.NewAggregateStatsReporter(&seriesStats),
 		),
-		promql.NewPrometheusQueryOpts(false, lookbackDelta),
+		&engine.QueryOpts{
+			LookbackDeltaParam:     lookbackDelta,
+			EnablePartialResponses: enablePartialResponse,
+		},
 		r.FormValue("query"),
 		ts,
 	)
@@ -651,7 +654,7 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 		return nil, nil, apiErr, func() {}
 	}
 
-	engine, _, apiErr := qapi.parseEngineParam(r)
+	eng, _, apiErr := qapi.parseEngineParam(r)
 	if apiErr != nil {
 		return nil, nil, apiErr, func() {}
 	}
@@ -677,7 +680,7 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 	)
 	if err := tracing.DoInSpanWithErr(ctx, "instant_query_create", func(ctx context.Context) error {
 		var err error
-		qry, err = engine.NewInstantQuery(
+		qry, err = eng.MakeInstantQuery(
 			ctx,
 			qapi.queryableCreate(
 				enableDedup,
@@ -689,7 +692,10 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 				shardInfo,
 				query.NewAggregateStatsReporter(&seriesStats),
 			),
-			promql.NewPrometheusQueryOpts(false, lookbackDelta),
+			&engine.QueryOpts{
+				LookbackDeltaParam:     lookbackDelta,
+				EnablePartialResponses: enablePartialResponse,
+			},
 			queryStr,
 			ts,
 		)
@@ -745,7 +751,7 @@ func (qapi *QueryAPI) query(r *http.Request) (interface{}, []error, *api.ApiErro
 }
 
 func (qapi *QueryAPI) queryRangeExplain(r *http.Request) (interface{}, []error, *api.ApiError, func()) {
-	engine, engineParam, apiErr := qapi.parseEngineParam(r)
+	eng, engineParam, apiErr := qapi.parseEngineParam(r)
 	if apiErr != nil {
 		return nil, nil, apiErr, func() {}
 	}
@@ -845,7 +851,7 @@ func (qapi *QueryAPI) queryRangeExplain(r *http.Request) (interface{}, []error, 
 	ctx = context.WithValue(ctx, tenancy.TenantKey, tenant)
 
 	var seriesStats []storepb.SeriesStatsCounter
-	qry, err := engine.NewRangeQuery(
+	qry, err := eng.MakeRangeQuery(
 		ctx,
 		qapi.queryableCreate(
 			enableDedup,
@@ -857,7 +863,10 @@ func (qapi *QueryAPI) queryRangeExplain(r *http.Request) (interface{}, []error, 
 			shardInfo,
 			query.NewAggregateStatsReporter(&seriesStats),
 		),
-		promql.NewPrometheusQueryOpts(false, lookbackDelta),
+		&engine.QueryOpts{
+			LookbackDeltaParam:     lookbackDelta,
+			EnablePartialResponses: enablePartialResponse,
+		},
 		r.FormValue("query"),
 		start,
 		end,
@@ -949,7 +958,7 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 		return nil, nil, apiErr, func() {}
 	}
 
-	engine, _, apiErr := qapi.parseEngineParam(r)
+	eng, _, apiErr := qapi.parseEngineParam(r)
 	if apiErr != nil {
 		return nil, nil, apiErr, func() {}
 	}
@@ -978,7 +987,7 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 	)
 	if err := tracing.DoInSpanWithErr(ctx, "range_query_create", func(ctx context.Context) error {
 		var err error
-		qry, err = engine.NewRangeQuery(
+		qry, err = eng.MakeRangeQuery(
 			ctx,
 			qapi.queryableCreate(
 				enableDedup,
@@ -990,7 +999,10 @@ func (qapi *QueryAPI) queryRange(r *http.Request) (interface{}, []error, *api.Ap
 				shardInfo,
 				query.NewAggregateStatsReporter(&seriesStats),
 			),
-			promql.NewPrometheusQueryOpts(false, lookbackDelta),
+			&engine.QueryOpts{
+				LookbackDeltaParam:     lookbackDelta,
+				EnablePartialResponses: enablePartialResponse,
+			},
 			queryStr,
 			start,
 			end,
@@ -1215,7 +1227,7 @@ func (qapi *QueryAPI) series(r *http.Request) (interface{}, []error, *api.ApiErr
 		sets = append(sets, q.Select(ctx, false, hints, mset...))
 	}
 
-	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
+	set := storage.NewMergeSeriesSet(sets, 0, storage.ChainedSeriesMerge)
 	warnings := set.Warnings()
 	for set.Next() {
 		metrics = append(metrics, set.At().Labels())

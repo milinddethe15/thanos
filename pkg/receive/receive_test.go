@@ -8,13 +8,12 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/stretchr/testify/require"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
-
+	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -210,7 +209,7 @@ func TestAddingExternalLabelsForTenants(t *testing.T) {
 
 			for _, c := range tc.cfg {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -294,7 +293,7 @@ func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
 
 		for _, c := range initialConfig {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
@@ -319,7 +318,7 @@ func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
 
 		for _, c := range changedConfig {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
@@ -534,7 +533,7 @@ func TestLabelSetsOfTenantsWhenChangingLabels(t *testing.T) {
 
 			for _, c := range initialConfig {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -704,7 +703,7 @@ func TestAddingLabelsWhenTenantAppearsInMultipleHashrings(t *testing.T) {
 
 			for _, c := range initialConfig {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -778,7 +777,7 @@ func TestReceiverLabelsNotOverwrittenByExternalLabels(t *testing.T) {
 
 		for _, c := range cfg {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
